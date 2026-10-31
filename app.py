@@ -6,8 +6,9 @@ from dateutil.relativedelta import relativedelta
 from fastapi import FastAPI, HTTPException, Query
 
 app = FastAPI(title="Tennis Abstract Analyst", version="0.1.0")
-BASE = "https://www.tennisabstract.com/cgi-bin/player-classic.cgi?p="
-HEADERS = {"User-Agent": "Mozilla/5.0 TennisAbstractAnalyst/0.1"}
+BASE_WTA = "https://www.tennisabstract.com/cgi-bin/wplayer.cgi?p="
+BASE_ATP = "https://www.tennisabstract.com/cgi-bin/player.cgi?p="
+HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36", "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8", "Accept-Language": "en-US,en;q=0.9", "Referer": "https://www.tennisabstract.com/"}
 BUCKETS = [f"{s} - {v}" for s in ("Hard","Clay","Grass") for v in ("Indoor","Outdoor","Unknown")]
 ALIASES = {
 "date":["date"],"tournament":["tournament","event"],"surface":["surface"],"round":["round","rnd"],
@@ -35,7 +36,7 @@ def frac(x):
 def pct(a,b): return round(100*a/b,2) if pd.notna(a) and pd.notna(b) and b else None
 def retrieve(player):
     slug=re.sub(r"[^A-Za-z0-9]","",player)
-    url=BASE+slug
+    url=(BASE_WTA if player.lower().endswith("wta") else BASE_WTA)+slug
     try:
         res=requests.get(url,headers=HEADERS,timeout=40); res.raise_for_status()
         tables=pd.read_html(res.text)
