@@ -34,13 +34,32 @@ def frac(x):
     m=re.search(r"(\d+)\s*/\s*(\d+)",str(x))
     return (float(m.group(1)),float(m.group(2))) if m else (None,None)
 def pct(a,b): return round(100*a/b,2) if pd.notna(a) and pd.notna(b) and b else None
-def retrieve(player):
+def retrieve(player, tour="auto"):
     slug=re.sub(r"[^A-Za-z0-9]","",player)
-    url=(BASE_WTA if player.lower().endswith("wta") else BASE_WTA)+slug
-    try:
-        res=requests.get(url,headers=HEADERS,timeout=40); res.raise_for_status()
-        tables=pd.read_html(res.text)
-    except Exception as e: raise HTTPException(502,f"Tennis Abstract retrieval failed: {type(e).__name__}: {e}")
+    if tour not in ("auto", "atp", "wta"):
+        raise HTTPException(400, "tour must be auto, atp or wta")
+    # Tennis Abstract uses player.cgi for ATP and wplayer.cgi for WTA.
+    # Auto tries the ATP route first, then the WTA route if no usable profile is found.
+    urls = ([("atp", "https://www.tennisabstract.com/cgi-bin/player.cgi?p="+slug),
+             ("wta", "https://www.tennisabstract.com/cgi-bin/wplayer.cgi?p="+slug)]
+            if tour == "auto" else
+            [(tour, ("https://www.tennisabstract.com/cgi-bin/player.cgi?p=" if tour == "atp" else "https://www.tennisabstract.com/cgi-bin/wplayer.cgi?p=")+slug)])
+    last_error = None
+    tables = None
+    url = None
+    for candidate_tour, candidate_url in urls:
+        try:
+            res=requests.get(candidate_url,headers=HEADERS,timeout=40)
+            res.raise_for_status()
+            candidate_tables=pd.read_html(res.text)
+            if candidate_tables:
+                tables=candidate_tables
+                url=candidate_url
+                break
+        except Exception as e:
+            last_error=e
+    if tables is None:
+        raise HTTPException(502,f"Tennis Abstract retrieval failed for {tour} profile: {type(last_error).__name__}: {last_error}")
     rows=[]
     for t in tables:
         cols=list(t.columns); dc=col_for(cols,"date"); oc=col_for(cols,"opponent")
@@ -87,8 +106,8 @@ def avg(df,c):
     if c not in df: return None
     a=pd.to_numeric(df[c],errors="coerce").dropna()
     return round(float(a.mean()),2) if len(a) else None
-def report(player,recent_n=10):
-    raw,url=retrieve(player); df=enrich(raw); today=pd.Timestamp(date.today())
+def report(player,recent_n=10,tour="auto"):
+    raw,url=retrieve(player,tour); df=enrich(raw); today=pd.Timestamp(date.today())
     cuts=[today-relativedelta(months=6),today-relativedelta(months=12)]
     out={}
     for b in BUCKETS:
@@ -111,4 +130,4 @@ def root(): return {"service":"Tennis Abstract Analyst API","docs":"/docs","exam
 @app.get("/health")
 def health(): return {"status":"ok"}
 @app.get("/player/{player_name}")
-def player(player_name:str,recent_n:int=Query(10,ge=5,le=10)): return report(player_name,recent_n)
+def player(player_name:str,recent_n:int=Query(10,ge=5,le=10),tour:str=Query("auto",pattern="^(auto|atp|wta)$")): return report(player_name,recent_n,tour)
