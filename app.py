@@ -16,16 +16,40 @@ TOURS = {
 HEADERS = {"User-Agent": "Tennis-Stats-Research/1.0 (personal non-commercial use)"}
 BUCKETS = [f"{s} - {v}" for s in ("Hard", "Clay", "Grass") for v in ("Indoor", "Outdoor", "Unknown")]
 
-@lru_cache(maxsize=12)
-def load_year(tour: str, year: int):
+SOURCE_COLUMNS = {
+    "tourney_date", "tourney_name", "surface", "round", "winner_name",
+    "loser_name", "score",
+    "w_ace", "w_df", "w_svpt", "w_1stIn", "w_1stWon", "w_2ndWon", "w_SvGms", "w_bpSaved", "w_bpFaced",
+    "l_ace", "l_df", "l_svpt", "l_1stIn", "l_1stWon", "l_2ndWon", "l_SvGms", "l_bpSaved", "l_bpFaced",
+}
+
+def load_player_year(tour: str, year: int, player: str):
+    """Stream one yearly CSV and retain only this player's rows to limit RAM."""
     folder, filename = TOURS[tour]
     url = f"{ARCHIVE}/{folder}/{filename.format(year=year)}"
-    response = requests.get(url, headers=HEADERS, timeout=45)
+    response = requests.get(url, headers=HEADERS, timeout=(10, 90), stream=True)
     if response.status_code == 404:
         return pd.DataFrame()
     response.raise_for_status()
-    from io import BytesIO
-    return pd.read_csv(BytesIO(response.content), low_memory=False)
+    response.raw.decode_content = True
+    target = clean_name(player)
+    matches = []
+    try:
+        chunks = pd.read_csv(
+            response.raw,
+            chunksize=25000,
+            usecols=lambda col: col in SOURCE_COLUMNS,
+            low_memory=True,
+        )
+        for chunk in chunks:
+            winners = chunk["winner_name"].fillna("").map(clean_name)
+            losers = chunk["loser_name"].fillna("").map(clean_name)
+            selected = chunk[(winners == target) | (losers == target)]
+            if not selected.empty:
+                matches.append(selected.copy())
+    finally:
+        response.close()
+    return pd.concat(matches, ignore_index=True) if matches else pd.DataFrame()
 
 def clean_name(value):
     return re.sub(r"[^a-z]", "", str(value).casefold())
@@ -121,15 +145,15 @@ def report(player, recent_n=10, tour="auto"):
     selected_tour = None
     frames = []
     for candidate in tours_to_try:
-        yearly = []
+        yearly_player_rows = []
         try:
             for year in range(2021, current_year + 1):
-                data = load_year(candidate, year)
+                data = load_player_year(candidate, year, player)
                 if not data.empty:
-                    yearly.append(data)
-            if yearly:
-                combined = pd.concat(yearly, ignore_index=True)
-                candidate_rows = make_player_rows(combined, player)
+                    yearly_player_rows.append(data)
+            if yearly_player_rows:
+                combined_player_matches = pd.concat(yearly_player_rows, ignore_index=True)
+                candidate_rows = make_player_rows(combined_player_matches, player)
                 if not candidate_rows.empty:
                     frames = [candidate_rows]
                     selected_tour = candidate
