@@ -1,133 +1,231 @@
 import re
 from datetime import date
+from functools import lru_cache
+
 import pandas as pd
 import requests
-from dateutil.relativedelta import relativedelta
 from fastapi import FastAPI, HTTPException, Query
 
-app = FastAPI(title="Tennis Abstract Analyst", version="0.1.0")
-BASE_WTA = "https://www.tennisabstract.com/cgi-bin/wplayer.cgi?p="
-BASE_ATP = "https://www.tennisabstract.com/cgi-bin/player.cgi?p="
-HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36", "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8", "Accept-Language": "en-US,en;q=0.9", "Referer": "https://www.tennisabstract.com/"}
-BUCKETS = [f"{s} - {v}" for s in ("Hard","Clay","Grass") for v in ("Indoor","Outdoor","Unknown")]
-ALIASES = {
-"date":["date"],"tournament":["tournament","event"],"surface":["surface"],"round":["round","rnd"],
-"opponent":["opponent","opponent name"],"score":["score","result"],"aces":["aces","ace"],
-"dfs":["dfs","double faults","double fault"],"first_in":["1stin","first in","first serve in"],
-"first_won":["1stwon","first won","1st serve points won"],"second_won":["2ndwon","second won","2nd serve points won"],
-"serve_pts":["svpts","serve points","service points"],"sv_games_won":["svgmswon","service games won","holds"],
-"sv_games":["svgms","service games"],"bp_saved":["bpsaved","break points saved"],"bp_faced":["bpfaced","break points faced"],
-"ret_pts_won":["retptswon","return points won"],"ret_pts":["retpts","return points"],
-"ret_games_won":["retgmswon","return games won","breaks"],"ret_games":["retgms","return games"],
-"venue":["venue","conditions","indoor/outdoor"]}
-def norm(x): return re.sub(r"[^a-z0-9]","",str(x).lower())
-def col_for(cols,key):
-    for a in ALIASES[key]:
-        for c in cols:
-            if norm(c)==norm(a) or (len(norm(a))>3 and norm(a) in norm(c)): return c
-    return None
-def num(x):
-    if pd.isna(x) or re.search(r"\d+\s*/\s*\d+",str(x)): return None
-    m=re.search(r"-?\d+(?:\.\d+)?",str(x))
-    return float(m.group()) if m else None
-def frac(x):
-    m=re.search(r"(\d+)\s*/\s*(\d+)",str(x))
-    return (float(m.group(1)),float(m.group(2))) if m else (None,None)
-def pct(a,b): return round(100*a/b,2) if pd.notna(a) and pd.notna(b) and b else None
-def retrieve(player, tour="auto"):
-    slug=re.sub(r"[^A-Za-z0-9]","",player)
+app = FastAPI(title="Tennis Abstract Analyst - Free Data Edition", version="0.2.0")
+
+ARCHIVE = "https://raw.githubusercontent.com/Aneeshers/tennis-sackmann-archive/main"
+TOURS = {
+    "atp": ("atp", "atp_matches_{year}.csv"),
+    "wta": ("wta", "wta_matches_{year}.csv"),
+}
+HEADERS = {"User-Agent": "Tennis-Stats-Research/1.0 (personal non-commercial use)"}
+BUCKETS = [f"{s} - {v}" for s in ("Hard", "Clay", "Grass") for v in ("Indoor", "Outdoor", "Unknown")]
+
+@lru_cache(maxsize=12)
+def load_year(tour: str, year: int):
+    folder, filename = TOURS[tour]
+    url = f"{ARCHIVE}/{folder}/{filename.format(year=year)}"
+    response = requests.get(url, headers=HEADERS, timeout=45)
+    if response.status_code == 404:
+        return pd.DataFrame()
+    response.raise_for_status()
+    from io import BytesIO
+    return pd.read_csv(BytesIO(response.content), low_memory=False)
+
+def clean_name(value):
+    return re.sub(r"[^a-z]", "", str(value).casefold())
+
+def pct(n, d):
+    try:
+        if pd.isna(n) or pd.isna(d) or float(d) == 0:
+            return None
+        return round(100.0 * float(n) / float(d), 2)
+    except (TypeError, ValueError):
+        return None
+
+def safe_num(row, key):
+    value = row.get(key)
+    try:
+        return float(value) if pd.notna(value) else None
+    except (TypeError, ValueError):
+        return None
+
+def make_player_rows(matches, player):
+    target = clean_name(player)
+    rows = []
+    for _, m in matches.iterrows():
+        winner = clean_name(m.get("winner_name", ""))
+        loser = clean_name(m.get("loser_name", ""))
+        if target not in (winner, loser):
+            continue
+        is_winner = target == winner
+        prefix = "w_" if is_winner else "l_"
+        opp_prefix = "l_" if is_winner else "w_"
+        r = {
+            "date": pd.to_datetime(str(m.get("tourney_date", "")), format="%Y%m%d", errors="coerce"),
+            "tournament": m.get("tourney_name"),
+            "round": m.get("round"),
+            "opponent": m.get("loser_name" if is_winner else "winner_name"),
+            "score": m.get("score"),
+            "surface": m.get("surface"),
+            "result": "W" if is_winner else "L",
+            "aces": safe_num(m, prefix + "ace"),
+            "dfs": safe_num(m, prefix + "df"),
+        }
+        svpt = safe_num(m, prefix + "svpt")
+        first_in = safe_num(m, prefix + "1stIn")
+        first_won = safe_num(m, prefix + "1stWon")
+        second_won = safe_num(m, prefix + "2ndWon")
+        r["first_in_pct"] = pct(first_in, svpt)
+        r["first_won_pct"] = pct(first_won, first_in)
+        r["second_won_pct"] = pct(second_won, (svpt - first_in) if svpt is not None and first_in is not None else None)
+        faced_svpt = safe_num(m, opp_prefix + "svpt")
+        opp_first_won = safe_num(m, opp_prefix + "1stWon")
+        opp_second_won = safe_num(m, opp_prefix + "2ndWon")
+        return_won = (faced_svpt - opp_first_won - opp_second_won
+                      if None not in (faced_svpt, opp_first_won, opp_second_won) else None)
+        r["return_points_won_pct"] = pct(return_won, faced_svpt)
+        bp_saved = safe_num(m, prefix + "bpSaved")
+        bp_faced = safe_num(m, prefix + "bpFaced")
+        r["bp_saved_pct"] = pct(bp_saved, bp_faced)
+        # The source does not provide total return games won or total service games won.
+        r["service_games_won_pct"] = None
+        r["return_games_won_pct"] = None
+        # Venue is not supplied in this archive; do not infer indoor/outdoor from event name.
+        r["venue_type"] = "Unknown"
+        surface = str(r["surface"]).title() if pd.notna(r["surface"]) else "Unknown"
+        r["surface_type"] = surface if surface in ("Hard", "Clay", "Grass") else "Unknown"
+        r["surface_bucket"] = r["surface_type"] + " - Unknown" if r["surface_type"] != "Unknown" else "Unknown"
+        rows.append(r)
+    return pd.DataFrame(rows)
+
+METRICS = [
+    ("Aces per match", "aces"),
+    ("Double faults per match", "dfs"),
+    ("First serve %", "first_in_pct"),
+    ("1st serve points won %", "first_won_pct"),
+    ("2nd serve points won %", "second_won_pct"),
+    ("Service games won %", "service_games_won_pct"),
+    ("Break points saved %", "bp_saved_pct"),
+    ("Return points won %", "return_points_won_pct"),
+    ("Return games won %", "return_games_won_pct"),
+]
+
+def mean_value(frame, column):
+    if column not in frame:
+        return None
+    values = pd.to_numeric(frame[column], errors="coerce").dropna()
+    return round(float(values.mean()), 2) if len(values) else None
+
+def report(player, recent_n=10, tour="auto"):
     if tour not in ("auto", "atp", "wta"):
         raise HTTPException(400, "tour must be auto, atp or wta")
-    # Tennis Abstract uses player.cgi for ATP and wplayer.cgi for WTA.
-    # Auto tries the ATP route first, then the WTA route if no usable profile is found.
-    urls = ([("atp", "https://www.tennisabstract.com/cgi-bin/player.cgi?p="+slug),
-             ("wta", "https://www.tennisabstract.com/cgi-bin/wplayer.cgi?p="+slug)]
-            if tour == "auto" else
-            [(tour, ("https://www.tennisabstract.com/cgi-bin/player.cgi?p=" if tour == "atp" else "https://www.tennisabstract.com/cgi-bin/wplayer.cgi?p=")+slug)])
+    tours_to_try = ["atp", "wta"] if tour == "auto" else [tour]
+    current_year = date.today().year
     last_error = None
-    tables = None
-    url = None
-    for candidate_tour, candidate_url in urls:
+    selected_tour = None
+    frames = []
+    for candidate in tours_to_try:
+        yearly = []
         try:
-            res=requests.get(candidate_url,headers=HEADERS,timeout=40)
-            res.raise_for_status()
-            candidate_tables=pd.read_html(res.text)
-            if candidate_tables:
-                tables=candidate_tables
-                url=candidate_url
-                break
-        except Exception as e:
-            last_error=e
-    if tables is None:
-        raise HTTPException(502,f"Tennis Abstract retrieval failed for {tour} profile: {type(last_error).__name__}: {last_error}")
-    rows=[]
-    for t in tables:
-        cols=list(t.columns); dc=col_for(cols,"date"); oc=col_for(cols,"opponent")
-        if dc is None or oc is None: continue
-        for _,r in t.iterrows():
-            z={"player":player}
-            for k in ALIASES:
-                c=col_for(cols,k)
-                if c is not None: z[k]=r[c]
-            if "date" not in z: continue
-            z["date"]=pd.to_datetime(z["date"],errors="coerce")
-            for k in ["aces","dfs","first_in","first_won","second_won","serve_pts","sv_games_won","sv_games","bp_saved","bp_faced","ret_pts_won","ret_pts","ret_games_won","ret_games"]:
-                if k in z:
-                    n,d=frac(z[k]); z[k+"_n"]=n; z[k+"_d"]=d; z[k]=num(z[k])
-            rows.append(z)
-    if not rows: raise HTTPException(502,"No recognizable match-log table. Tennis Abstract markup may have changed or this profile exposes no match log.")
-    df=pd.DataFrame(rows).dropna(subset=["date"])
-    keys=[k for k in ["date","tournament","opponent","score"] if k in df]
-    return df.drop_duplicates(subset=keys).sort_values("date",ascending=False),url
-def enrich(df,venue_overrides=None):
-    x=df.copy()
-    s=x["surface"].astype(str).str.lower() if "surface" in x else pd.Series("",index=x.index)
-    x["surface_type"]="Unknown"
-    for term in ["Hard","Clay","Grass"]: x.loc[s.str.contains(term.lower()),"surface_type"]=term
-    x["venue_type"]="Unknown"
-    if "venue" in x:
-        v=x["venue"].astype(str).str.lower()
-        x.loc[v.str.contains(r"\bindoor\b"),"venue_type"]="Indoor"
-        x.loc[v.str.contains(r"\boutdoor\b"),"venue_type"]="Outdoor"
-    for event,venue in (venue_overrides or {}).items():
-        if venue in ["Indoor","Outdoor"] and "tournament" in x:
-            x.loc[x.tournament.astype(str).str.casefold()==event.casefold(),"venue_type"]=venue
-    x["surface_bucket"]=x.surface_type+" - "+x.venue_type
-    x.loc[x.surface_type.eq("Unknown"),"surface_bucket"]="Unknown"
-    x["first_in_pct"]=[pct(n,d) for n,d in zip(x.get("first_in_n",x.get("first_in",pd.Series(index=x.index,dtype=float))),x.get("serve_pts",pd.Series(index=x.index,dtype=float)))]
-    x["first_won_pct"]=[pct(n,d) for n,d in zip(x.get("first_won_n",x.get("first_won",pd.Series(index=x.index,dtype=float))),x.get("first_in_n",x.get("first_in",pd.Series(index=x.index,dtype=float))))]
-    second=x.get("serve_pts",pd.Series(index=x.index,dtype=float))-x.get("first_in",pd.Series(index=x.index,dtype=float))
-    x["second_won_pct"]=[pct(n,d) for n,d in zip(x.get("second_won",pd.Series(index=x.index,dtype=float)),second)]
-    for out,n,d in [("service_games_won_pct","sv_games_won","sv_games"),("bp_saved_pct","bp_saved","bp_faced"),("return_points_won_pct","ret_pts_won","ret_pts"),("return_games_won_pct","ret_games_won","ret_games")]:
-        x[out]=[pct(a,b) for a,b in zip(x.get(n,pd.Series(index=x.index,dtype=float)),x.get(d,pd.Series(index=x.index,dtype=float)))]
-    return x
-METRICS=[("Aces per match","aces"),("Double faults per match","dfs"),("First serve %","first_in_pct"),("1st serve points won %","first_won_pct"),("2nd serve points won %","second_won_pct"),("Service games won %","service_games_won_pct"),("Break points saved %","bp_saved_pct"),("Return points won %","return_points_won_pct"),("Return games won %","return_games_won_pct")]
-def avg(df,c):
-    if c not in df: return None
-    a=pd.to_numeric(df[c],errors="coerce").dropna()
-    return round(float(a.mean()),2) if len(a) else None
-def report(player,recent_n=10,tour="auto"):
-    raw,url=retrieve(player,tour); df=enrich(raw); today=pd.Timestamp(date.today())
-    cuts=[today-relativedelta(months=6),today-relativedelta(months=12)]
-    out={}
-    for b in BUCKETS:
-        p=df[df.surface_bucket.eq(b)].sort_values("date",ascending=False)
-        if p.empty: continue
-        usable=p.dropna(subset=[c for _,c in METRICS if c in p],how="all").head(5)
-        six=p[p.date>=cuts[0]]; twelve=p[p.date>=cuts[1]]
-        stats=[]
-        for label,c in METRICS:
-            last=avg(usable,c); career=avg(p,c)
-            trend="Insufficient data" if last is None or career is None else ("Stable" if abs(last-career)<=(.25 if "per match" in label else 1) else ("Above career surface average" if last>career else "Below career surface average"))
-            stats.append({"statistic":label,"last_5":last,"six_month":avg(six,c),"twelve_month":avg(twelve,c),"career":career,"trend":trend})
-        results=[]
-        for _,r in p.head(recent_n).iterrows():
-            results.append({k:(r[k].date().isoformat() if k=="date" and pd.notna(r[k]) else (str(r[k]) if k in r and pd.notna(r[k]) else None)) for k in ["date","tournament","round","opponent","score","surface"]})
-        out[b]={"recent_results":results,"last_five_with_stats":len(usable),"sample_sizes":{"six_month":len(six),"twelve_month":len(twelve),"career":len(p)},"statistics":stats}
-    return {"player":player,"source":"Tennis Abstract","source_url":url,"retrieved_on":date.today().isoformat(),"match_rows":len(df),"surface_venue_reports":out,"notes":["Null means unavailable, not zero.","Venue is Unknown unless explicit on page or supplied as a verified override.","Last-five statistics use up to five latest matches with at least one usable statistic.","Averages are match-level means."]}
+            for year in range(2021, current_year + 1):
+                data = load_year(candidate, year)
+                if not data.empty:
+                    yearly.append(data)
+            if yearly:
+                combined = pd.concat(yearly, ignore_index=True)
+                candidate_rows = make_player_rows(combined, player)
+                if not candidate_rows.empty:
+                    frames = [candidate_rows]
+                    selected_tour = candidate
+                    break
+        except Exception as exc:
+            last_error = exc
+    if not frames:
+        if last_error:
+            raise HTTPException(502, f"Free dataset retrieval failed: {type(last_error).__name__}: {last_error}")
+        raise HTTPException(404, "Player not found in the free 2021-present ATP/WTA match archive. Try the exact player name or set tour=atp/wta.")
+    df = frames[0].dropna(subset=["date"]).sort_values("date", ascending=False)
+    df = df.drop_duplicates(subset=["date", "tournament", "opponent", "score"])
+    recent = []
+    for _, r in df.head(recent_n).iterrows():
+        recent.append({
+            "date": r["date"].date().isoformat(),
+            "tournament": None if pd.isna(r["tournament"]) else str(r["tournament"]),
+            "round": None if pd.isna(r["round"]) else str(r["round"]),
+            "opponent": None if pd.isna(r["opponent"]) else str(r["opponent"]),
+            "result": r["result"],
+            "score": None if pd.isna(r["score"]) else str(r["score"]),
+            "surface": None if pd.isna(r["surface"]) else str(r["surface"]),
+        })
+    out = {}
+    today = pd.Timestamp(date.today())
+    six_month_cutoff = today - pd.DateOffset(months=6)
+    twelve_month_cutoff = today - pd.DateOffset(months=12)
+    for bucket in BUCKETS:
+        subset = df[df.surface_bucket == bucket].sort_values("date", ascending=False)
+        if subset.empty:
+            continue
+        last_five = subset.head(5)
+        six_month = subset[subset.date >= six_month_cutoff]
+        twelve_month = subset[subset.date >= twelve_month_cutoff]
+        stats = []
+        for label, column in METRICS:
+            last = mean_value(last_five, column)
+            career = mean_value(subset, column)
+            if last is None or career is None:
+                trend = "N/A - insufficient source statistics"
+            elif abs(last - career) <= (0.25 if "per match" in label else 1):
+                trend = "Stable"
+            elif last > career:
+                trend = "Above career surface average"
+            else:
+                trend = "Below career surface average"
+            stats.append({
+                "statistic": label,
+                "last_5": last,
+                "six_month": mean_value(six_month, column),
+                "twelve_month": mean_value(twelve_month, column),
+                "career": career,
+                "trend": trend,
+            })
+        out[bucket] = {
+            "last_five_with_stats": int(last_five.dropna(subset=[c for _, c in METRICS], how="all").shape[0]),
+            "sample_sizes": {
+                "six_month": int(len(six_month)),
+                "twelve_month": int(len(twelve_month)),
+                "career_since_2021": int(len(subset)),
+            },
+            "statistics": stats,
+        }
+    return {
+        "player": player,
+        "tour": selected_tour.upper(),
+        "source": "Jeff Sackmann tennis datasets (archival GitHub mirror)",
+        "source_url": "https://github.com/Aneeshers/tennis-sackmann-archive",
+        "source_coverage": "2021-present match archive; source update cadence may vary",
+        "license_note": "CC BY-NC-SA 4.0: attribution required; non-commercial use only; share-alike applies.",
+        "retrieved_on": date.today().isoformat(),
+        "matches_found": int(len(df)),
+        "recent_results": recent,
+        "surface_venue_reports": out,
+        "notes": [
+            "N/A means the source does not provide that statistic; it is not zero.",
+            "Indoor/outdoor is Unknown because the source does not provide verified venue type.",
+            "Only Hard, Clay and Grass are split into surface buckets.",
+            "WTA match-level serve statistics are generally absent in this source; unavailable values remain N/A.",
+            "Service-games-won percentage and return-games-won percentage are not supplied and are not inferred.",
+            "Recent and average statistics are based on available matches since 2021, not a complete career archive.",
+        ],
+    }
+
 @app.get("/")
-def root(): return {"service":"Tennis Abstract Analyst API","docs":"/docs","example":"/player/Antonia%20Ruzic?recent_n=10"}
+def root():
+    return {"service": "Tennis Analyst API - Free Data Edition", "docs": "/docs", "example_atp": "/player/Novak%20Djokovic?recent_n=10&tour=atp", "example_wta": "/player/Elena%20Rybakina?recent_n=10&tour=wta"}
+
 @app.get("/health")
-def health(): return {"status":"ok"}
+def health():
+    return {"status": "ok"}
+
 @app.get("/player/{player_name}")
-def player(player_name:str,recent_n:int=Query(10,ge=5,le=10),tour:str=Query("auto",pattern="^(auto|atp|wta)$")): return report(player_name,recent_n,tour)
+def player(
+    player_name: str,
+    recent_n: int = Query(10, ge=5, le=10),
+    tour: str = Query("auto", pattern="^(auto|atp|wta)$"),
+):
+    return report(player_name, recent_n, tour)
